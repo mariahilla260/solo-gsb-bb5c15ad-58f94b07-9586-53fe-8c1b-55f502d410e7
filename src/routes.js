@@ -8,7 +8,7 @@ const { toMarkdown, toReplayMarkdown } = require('./report');
 const { findCycle, cycleMessage, MAX_WAIT_SECONDS } = require('./dependencies');
 const {
   buildImportPlan,
-  commitImport,
+  prepareCommit,
   ImportFileError,
   TEMPLATE_HEADER,
 } = require('./import');
@@ -312,35 +312,50 @@ router.get('/evacuation', (req, res) => {
   res.json(evacuationSnapshot(data, mode, params.time, params.exits));
 });
 
-router.post('/reset', (req, res) => {
-  store.reset();
-  res.json(store.load());
+router.post('/reset', (req, res, next) => {
+  try {
+    res.json(store.reset());
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* ---------- 走位方案基线 ---------- */
 
 /** 保存（或覆盖）当前模式的基线快照 */
-router.post('/baseline/:mode', (req, res) => {
+router.post('/baseline/:mode', (req, res, next) => {
   const { mode } = req.params;
   if (!MODES.includes(mode)) return res.status(400).json({ error: 'mode 必须是 classic 或 propagate' });
-  const data = store.load();
-  const result = validate(data, mode);
-  data.baselines[mode] = { savedAt: new Date().toISOString(), result };
-  store.save();
-  res.status(201).json({ baseline: baselineMeta(data, mode), comparison: buildComparison(result, data.baselines[mode].result) });
+  try {
+    const { data, result } = store.commit((draft) => {
+      const r = validate(draft, mode);
+      draft.baselines[mode] = { savedAt: new Date().toISOString(), result: r };
+      return r;
+    });
+    res.status(201).json({
+      baseline: baselineMeta(data, mode),
+      comparison: buildComparison(result, data.baselines[mode].result),
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 /** 清除基线：指定模式；all 清除全部模式 */
-router.delete('/baseline/:mode', (req, res) => {
+router.delete('/baseline/:mode', (req, res, next) => {
   const { mode } = req.params;
   if (mode !== 'all' && !MODES.includes(mode)) {
     return res.status(400).json({ error: 'mode 必须是 classic 或 propagate（或 all）' });
   }
-  const data = store.load();
-  if (mode === 'all') data.baselines = {};
-  else delete data.baselines[mode];
-  store.save();
-  res.status(204).end();
+  try {
+    store.commit((draft) => {
+      if (mode === 'all') draft.baselines = {};
+      else delete draft.baselines[mode];
+    });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* ---------- 跨演员口令依赖 ---------- */
@@ -354,7 +369,7 @@ function pruneDependencies(data) {
 }
 
 /** 新增依赖：写入前对整张依赖图做环检测，成环（含自环、重复反向边）不写入 */
-router.post('/dependencies', (req, res) => {
+router.post('/dependencies', (req, res, next) => {
   const data = store.load();
   const body = req.body || {};
   const cueIds = new Set(data.cues.map((c) => c.id));
@@ -372,32 +387,61 @@ router.post('/dependencies', (req, res) => {
   );
   if (dup) return res.status(409).json({ error: '这两条口令之间已存在相同方向的依赖' });
 
+  // 预检环（针对已发布版本 + 候选边）：成环返回 400 且不进入提交流程
   const candidate = {
     id: crypto.randomUUID(),
     predecessorId: body.predecessorId,
     successorId: body.successorId,
     waitSeconds: body.waitSeconds,
   };
-  data.dependencies.push(candidate);
-
-  const cycle = findCycle(data.dependencies);
+  const cycle = findCycle(data.dependencies.concat(candidate));
   if (cycle) {
-    data.dependencies.pop(); // 成环：不写入
     return res.status(400).json({ error: cycleMessage(data, cycle), cycle });
   }
 
-  store.save();
-  res.status(201).json(candidate);
+  try {
+    const { result } = store.commit((draft) => {
+      // 提交时在隔离快照上再检测一次（防御并发修改）：成环则中止，该副本永不发布
+      const c = findCycle(draft.dependencies.concat(candidate));
+      if (c) {
+        const err = new Error(cycleMessage(draft, c));
+        err.statusCode = 400;
+        err.cycle = c;
+        throw err;
+      }
+      draft.dependencies.push(candidate);
+      return candidate;
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    if (err.statusCode === 400) {
+      return res.status(400).json({ error: err.message, cycle: err.cycle });
+    }
+    next(err);
+  }
 });
 
 /** 删除依赖 */
-router.delete('/dependencies/:id', (req, res) => {
+router.delete('/dependencies/:id', (req, res, next) => {
   const data = store.load();
   const idx = data.dependencies.findIndex((d) => d.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: '依赖不存在' });
-  data.dependencies.splice(idx, 1);
-  store.save();
-  res.status(204).end();
+  const id = req.params.id;
+  try {
+    store.commit((draft) => {
+      const at = draft.dependencies.findIndex((d) => d.id === id);
+      if (at === -1) {
+        const err = new Error('依赖不存在');
+        err.statusCode = 404;
+        throw err;
+      }
+      draft.dependencies.splice(at, 1);
+    });
+    res.status(204).end();
+  } catch (err) {
+    if (err.statusCode === 404) return res.status(404).json({ error: err.message });
+    next(err);
+  }
 });
 
 /* ---------- 演员换装核查 ---------- */
@@ -419,7 +463,7 @@ router.get('/costume-changes/evaluate', (req, res) => {
 });
 
 /** 登记换装任务：同一演员相邻两条口令 + 换装区域 + 所需整数秒数；每个区段最多一项 */
-router.post('/costume-changes', (req, res) => {
+router.post('/costume-changes', (req, res, next) => {
   const data = store.load();
   const body = req.body || {};
   const fromCue = data.cues.find((c) => c.id === body.fromCueId);
@@ -453,19 +497,37 @@ router.post('/costume-changes', (req, res) => {
     areaId: body.areaId,
     seconds: body.seconds,
   };
-  data.costumeChanges.push(task);
-  store.save();
-  res.status(201).json(task);
+  try {
+    store.commit((draft) => {
+      draft.costumeChanges.push(task);
+    });
+    res.status(201).json(task);
+  } catch (err) {
+    next(err);
+  }
 });
 
 /** 删除换装任务 */
-router.delete('/costume-changes/:id', (req, res) => {
+router.delete('/costume-changes/:id', (req, res, next) => {
   const data = store.load();
-  const idx = data.costumeChanges.findIndex((t) => t.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: '换装任务不存在' });
-  data.costumeChanges.splice(idx, 1);
-  store.save();
-  res.status(204).end();
+  const exists = data.costumeChanges.some((t) => t.id === req.params.id);
+  if (!exists) return res.status(404).json({ error: '换装任务不存在' });
+  const id = req.params.id;
+  try {
+    store.commit((draft) => {
+      const at = draft.costumeChanges.findIndex((t) => t.id === id);
+      if (at === -1) {
+        const err = new Error('换装任务不存在');
+        err.statusCode = 404;
+        throw err;
+      }
+      draft.costumeChanges.splice(at, 1);
+    });
+    res.status(204).end();
+  } catch (err) {
+    if (err.statusCode === 404) return res.status(404).json({ error: err.message });
+    next(err);
+  }
 });
 
 /* ---------- 排练数据 CSV 导入 ---------- */
@@ -500,8 +562,8 @@ router.post('/import/preview', (req, res) => {
   res.json(plan);
 });
 
-/** 提交导入：底库版本变化返回 409 要求重新预览；否则一次性写入全部新演员和口令 */
-router.post('/import/commit', (req, res) => {
+/** 提交导入：底库版本变化返回 409 要求重新预览；否则在隔离快照上一次性写入全部新演员和口令 */
+router.post('/import/commit', (req, res, next) => {
   const data = store.load();
   const csv = typeof (req.body && req.body.csv) === 'string' ? req.body.csv : '';
   const expectedVersion = req.body && req.body.version;
@@ -510,28 +572,38 @@ router.post('/import/commit', (req, res) => {
     return res.status(400).json({ error: '缺少数据版本，请先重新预览后再提交' });
   }
 
-  let result;
+  let prepared;
   try {
-    result = commitImport(data, csv, expectedVersion);
+    prepared = prepareCommit(data, csv, expectedVersion);
   } catch (err) {
     if (err instanceof ImportFileError) return res.status(400).json({ error: err.message });
-    throw err;
+    next(err);
+    return;
   }
 
-  if (result.status === 'stale') {
+  if (prepared.status === 'stale') {
     return res.status(409).json({
       error: '底库数据已变化（演员 / 区域 / 口令被修改），请重新预览后再提交',
-      currentVersion: result.currentVersion,
+      currentVersion: prepared.currentVersion,
     });
   }
-  if (result.status === 'invalid') {
-    return res.status(400).json({ error: 'CSV 中仍存在错误行，请修正后重新预览', plan: result.plan });
+  if (prepared.status === 'invalid') {
+    return res.status(400).json({ error: 'CSV 中仍存在错误行，请修正后重新预览', plan: prepared.plan });
   }
-  res.status(201).json({
-    createdActors: result.createdActors,
-    createdCues: result.createdCues,
-    version: result.version,
-  });
+
+  // 隔离快照上完成全部追加并原子落盘：写文件失败由错误处理中间件返回 500，
+  // 已发布内存版本不替换、磁盘正式文件保持提交前内容
+  try {
+    const { result } = store.commit(prepared.apply);
+    res.status(201).json({
+      createdActors: result.createdActors,
+      createdCues: result.createdCues,
+      version: result.version,
+    });
+  } catch (err) {
+    if (err instanceof ImportFileError) return res.status(400).json({ error: err.message });
+    next(err);
+  }
 });
 
 /* ---------- 现场走位复盘 ---------- */
@@ -584,7 +656,7 @@ router.get('/rigging', (req, res) => {
 
 const COLLECTIONS = ['areas', 'edges', 'actors', 'cues', 'audiencePoints', 'targets', 'obstacles', 'rigPoints', 'rigItems'];
 
-router.post('/:collection', (req, res) => {
+router.post('/:collection', (req, res, next) => {
   const { collection } = req.params;
   if (!COLLECTIONS.includes(collection)) return res.status(404).json({ error: '未知资源类型' });
 
@@ -603,12 +675,17 @@ router.post('/:collection', (req, res) => {
     if (dup) return res.status(409).json({ error: '两个区域之间已存在连接，可直接编辑耗时' });
   }
 
-  data[collection].push(item);
-  store.save();
-  res.status(201).json(item);
+  try {
+    store.commit((draft) => {
+      draft[collection].push(item);
+    });
+    res.status(201).json(item);
+  } catch (e) {
+    next(e);
+  }
 });
 
-router.put('/:collection/:id', (req, res) => {
+router.put('/:collection/:id', (req, res, next) => {
   const { collection, id } = req.params;
   if (!COLLECTIONS.includes(collection)) return res.status(404).json({ error: '未知资源类型' });
 
@@ -642,18 +719,26 @@ router.put('/:collection/:id', (req, res) => {
     }
   }
 
-  Object.assign(item, updates);
-  store.save();
-  res.json(item);
+  // 提交在隔离快照上完成：Object.assign 与后续原子落盘都不触碰已发布版本，
+  // 落盘成功后才整体发布；响应体为发布后快照中的同一条记录。
+  try {
+    const { data: published } = store.commit((draft) => {
+      const target = draft[collection].find((x) => x.id === id);
+      Object.assign(target, updates);
+    });
+    res.json(published[collection].find((x) => x.id === id));
+  } catch (e) {
+    next(e);
+  }
 });
 
-router.delete('/:collection/:id', (req, res) => {
+router.delete('/:collection/:id', (req, res, next) => {
   const { collection, id } = req.params;
   if (!COLLECTIONS.includes(collection)) return res.status(404).json({ error: '未知资源类型' });
 
   const data = store.load();
-  const idx = data[collection].findIndex((x) => x.id === id);
-  if (idx === -1) return res.status(404).json({ error: '记录不存在' });
+  const exists = data[collection].some((x) => x.id === id);
+  if (!exists) return res.status(404).json({ error: '记录不存在' });
 
   // 吊点被吊挂件引用时提示并拒绝删除
   if (collection === 'rigPoints') {
@@ -666,23 +751,35 @@ router.delete('/:collection/:id', (req, res) => {
     }
   }
 
-  data[collection].splice(idx, 1);
+  // 删除与级联清理全部在隔离快照上一次完成，再原子落盘、发布新版本
+  try {
+    store.commit((draft) => {
+      const idx = draft[collection].findIndex((x) => x.id === id);
+      if (idx === -1) {
+        const e = new Error('记录不存在');
+        e.statusCode = 404;
+        throw e;
+      }
+      draft[collection].splice(idx, 1);
 
-  // 级联清理，保证校验数据一致
-  if (collection === 'areas') {
-    data.edges = data.edges.filter((e) => e.a !== id && e.b !== id);
-    data.cues = data.cues.filter((c) => c.areaId !== id);
-  } else if (collection === 'actors') {
-    data.cues = data.cues.filter((c) => c.actorId !== id);
+      // 级联清理，保证校验数据一致
+      if (collection === 'areas') {
+        draft.edges = draft.edges.filter((e) => e.a !== id && e.b !== id);
+        draft.cues = draft.cues.filter((c) => c.areaId !== id);
+      } else if (collection === 'actors') {
+        draft.cues = draft.cues.filter((c) => c.actorId !== id);
+      }
+
+      // 删除口令（或因删除区域 / 演员连带删除口令）后，级联清理相关口令依赖
+      pruneDependencies(draft);
+      // 删除口令 / 区域（含连带删除口令）后，级联清理相关换装任务
+      pruneCostumeChanges(draft);
+    });
+    res.status(204).end();
+  } catch (e) {
+    if (e.statusCode === 404) return res.status(404).json({ error: e.message });
+    next(e);
   }
-
-  // 删除口令（或因删除区域 / 演员连带删除口令）后，级联清理相关口令依赖
-  pruneDependencies(data);
-  // 删除口令 / 区域（含连带删除口令）后，级联清理相关换装任务
-  pruneCostumeChanges(data);
-
-  store.save();
-  res.status(204).end();
 });
 
 module.exports = router;

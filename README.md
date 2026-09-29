@@ -8,6 +8,70 @@
 
 技术栈：Node.js + Express + 原生 HTML/CSS/JavaScript（无任何前端构建步骤）。
 
+## 变动说明（写操作统一为完整快照原子提交）
+
+排练中连续编辑（资源增改删、口令依赖、换装任务、基线、CSV 导入、恢复示例数据）过去都是**先改内存、再整文件覆写**：若覆写过程中磁盘出错（空间不足 / 权限 / 卷故障），内存已是新数据而磁盘文件可能只写了一半，下一次成功保存又会把内存状态整体落盘，重启后读到的文件甚至无法解析。
+
+现已把**所有写操作统一为同一条「完整快照提交」路径**（HTTP API 的输入、响应、状态码、CSV 导入预览版本规则、页面编辑流程与 Compose 启动方式均不变）：
+
+1. **隔离修改**：以当前已发布版本为底深拷贝一份完整快照，所有修改与级联清理（删除区域连带删除连接 / 口令、删除演员连带删除口令、口令依赖与换装任务清理等）都只发生在这份隔离快照上；此阶段任何报错都不会触及已发布版本。
+2. **完整文件原子落盘**：先把完整 JSON 写到数据目录内的临时文件（`.data.json.tmp-<pid>-<随机串>`）并 `fsync`，再用同目录 `rename` **原子替换** `data.json`（替换前先 `fsync` 临时文件、替换后 `fsync` 目录，容器卷不支持目录 fsync 时自动跳过）。
+3. **成功后才发布**：只有文件替换成功，隔离快照才替换为新的内存版本，接口随后返回成功——之后的查询 / 校验 / 报告 / 导入预览读到的才是新版本。
+4. **失败即服务端错误且零生效**：临时文件写入或原子替换任一步失败，接口返回 **500**，本次临时文件会被删除；已发布内存版本不替换（**现有查询仍读到提交前版本**），磁盘上的正式 `data.json` 字节不变、仍是完整 JSON、**重启后可正常读取**。
+5. **退出残留不覆盖正式数据**：临时文件与正式文件是两个独立路径，rename 之前进程退出只可能留下临时文件，**绝不会覆盖正式数据**；服务下次启动时会自动清理本前缀下的残留临时文件。
+
+涉及的写接口（语义、状态码均不变，仅提交路径统一）：九类资源的 `POST/PUT/DELETE`、`POST/DELETE /api/dependencies`、`POST/DELETE /api/costume-changes`、`POST/DELETE /api/baseline/:mode`、`POST /api/reset`、`POST /api/import/commit`（导入预览版本规则不变：版本不符仍返回 409、错误行仍返回 400 整批拒绝）。
+
+调用示例（服务启动见下文「一键启动」，以下 ID 取自内置示例数据）：
+
+```bash
+BASE=http://localhost:3000
+
+# 1) 资源编辑：成功 → 200，完整文件原子替换后查询立即读到新版本
+curl -X PUT $BASE/api/edges/edge-wingr-center \
+  -H 'Content-Type: application/json' \
+  -d '{"a":"area-wing-r","b":"area-center","seconds":7,"capacity":3,"closures":[{"start":20,"end":25}]}'
+
+#    删除区域（级联清理连接 / 口令 / 依赖 / 换装任务）→ 204，全部随同一份快照提交
+curl -X DELETE $BASE/api/areas/area-roof -i
+
+# 2) 口令依赖：新增 → 201；成环 → 400 且不写入；同方向重复 → 409
+curl -X POST $BASE/api/dependencies -H 'Content-Type: application/json' \
+  -d '{"predecessorId":"cue-l2","successorId":"cue-z3","waitSeconds":5}'
+curl -X DELETE $BASE/api/dependencies/<依赖ID> -i   # → 204
+
+# 3) 换装任务：登记 → 201；重复区段 → 409；删除 → 204
+curl -X POST $BASE/api/costume-changes -H 'Content-Type: application/json' \
+  -d '{"fromCueId":"cue-l2","toCueId":"cue-l3","areaId":"area-upstage","seconds":12}'
+curl -X DELETE $BASE/api/costume-changes/<任务ID> -i
+
+# 4) 基线：保存 / 覆盖 → 201；清除 → 204（:mode=all 清空全部）
+curl -X POST $BASE/api/baseline/propagate
+curl -X DELETE $BASE/api/baseline/classic -i
+
+# 5) CSV 导入：先预览取版本号，再提交；底库已变化 → 409（重新预览），错误行 → 400
+curl -s -X POST $BASE/api/import/preview -H 'Content-Type: application/json' \
+  -d '{"csv":"姓名,角色,目标区域,时间,停留秒数,口令说明\n导入测试员,饰 客,舞台中央,04:00,,候场\n"}'
+# 用上一步响应里的 version 提交 → 201：
+curl -i -X POST $BASE/api/import/commit -H 'Content-Type: application/json' \
+  -d '{"csv":"姓名,角色,目标区域,时间,停留秒数,口令说明\n导入测试员,饰 客,舞台中央,04:00,,候场\n","version":"<预览返回的 version>"}'
+
+# 6) 恢复示例数据（同时清空基线）→ 200，同样是完整快照原子提交
+curl -X POST $BASE/api/reset
+```
+
+磁盘故障时的可观察行为（以数据目录不可写为例，可用 `docker compose run` 挂载只读卷复现）：
+
+```text
+POST /api/actors  →  HTTP/1.1 500 Internal Server Error
+                   {"error":"服务器内部错误"}
+# 失败期间与失败之后：GET /api/data、/api/validate 等查询仍返回提交前的数据；
+# data.json 字节级保持提交前内容且为完整 JSON，重启服务后照常加载；
+# 失败请求不会留下可覆盖正式数据的临时文件。
+```
+
+回归测试见 `test/snapshot-commit.test.js`（`npm test`，独立临时数据目录）：覆盖正常提交（CRUD / 依赖 / 换装 / 基线 / 重置 / 导入）、临时文件**写入失败**与 **rename 替换失败**两种注入下的 500 与「内存不发布、文件不变、可重启读取、后续提交恢复正常」、级联删除失败回滚，以及启动时清理上次退出残留临时文件。
+
 ## 变动说明（连接编辑提交边界修复）
 
 `PUT /api/edges/:id` 过去在**端点重复检查之前**就把新端点 / 耗时 / 容量 / 封闭时段写入了内存中的现存记录，重复检查命中而返回 409 时，脏状态已经留在内存里：随后的 `GET /api/data` 与 `GET /api/validate`（走位校验）会读到被串改的连接，而**下一次任意成功保存**还会把这份脏状态整体写入数据文件。
@@ -96,7 +160,7 @@ docker compose up --build
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `3000` | Web 服务监听端口（Compose 中映射为主机 3000 端口） |
-| `DATA_DIR` | `./data`（容器内 `/app/data`） | 数据文件 `data.json` 存放目录 |
+| `DATA_DIR` | `./data`（容器内 `/app/data`） | 数据文件 `data.json` 存放目录；写操作先在该目录内生成临时文件（`.data.json.tmp-*`）再原子替换 `data.json`，因此该目录需对运行用户可写 |
 
 Compose 默认将数据目录挂载为命名卷 `stage-data` 以持久化修改；执行 `docker compose down -v` 删除卷后重启即可恢复示例数据（也可在页面右上角点击「恢复示例数据」）。
 
@@ -378,15 +442,15 @@ npm start
 | DELETE | `/api/costume-changes/:id` | 删除一项换装任务；删除口令 / 演员 / 区域时相关任务由服务端自动级联清理，无需调用本接口 |
 | POST | `/api/baseline/:mode` | 保存（或覆盖）指定模式（`classic` / `propagate`）的基线快照，基线随数据持久化 |
 | DELETE | `/api/baseline/:mode` | 清除指定模式基线；`:mode` 传 `all` 清除全部模式基线 |
-| POST | `/api/reset` | 恢复内置示例数据（同时清空全部基线） |
+| POST | `/api/reset` | 恢复内置示例数据（同时清空全部基线）；经统一快照提交：完整文件原子替换成功后才发布，写文件失败返回 500 且现有数据（内存与磁盘）不变 |
 | GET | `/api/import/template` | 下载排练数据导入 CSV 模板（UTF-8 带 BOM、含表头与示例行） |
 | POST | `/api/import/preview` | 上传 CSV 生成导入预览（不写库）：请求体 `{ csv }`，返回 `rows`（逐行解析结果与 `issues` 错误列表、`valid` 标记、演员复用 / 新建状态与区域匹配状态；文件内重复按解析后的「演员身份 + 目标区域 + 整数秒」判定，首次行带 `firstOccurrence` / `duplicateSeqs`、后续重复行带 `duplicateOf`）、`newActors`（将新建的演员）、`summary`（总行数 / 可导入 / 错误行 / 新增演员 / 新增口令 / 未知区域 / 重名区域 / 文件内重复 / 冲突计数）与 `version`（底库数据版本哈希）；CSV 结构错误（空文件、缺必需列、**非法引号——未加引号字段中出现引号、闭合引号后夹带字符、引号未闭合**、仅有表头）返回 400，且不会产生任何预览行或新建演员 |
-| POST | `/api/import/commit` | 提交导入：请求体 `{ csv, version }`；底库版本与 `version` 不一致返回 **409**（要求重新预览）；按原始 CSV 重新解析并**复用预览的同一判重口径**复核，存在**文件结构错误（含非法引号）**或错误行（含文件内重复 / 现有口令冲突）返回 400 且**整批拒绝、不写入任何演员或口令**；校验通过则一次性原子写入全部新演员与口令，返回 `{ createdActors, createdCues, version }`（201），合法文件实际新增数与预览数一致，任何写入失败均回滚、不部分落库 |
+| POST | `/api/import/commit` | 提交导入：请求体 `{ csv, version }`；底库版本与 `version` 不一致返回 **409**（要求重新预览）；按原始 CSV 重新解析并**复用预览的同一判重口径**复核，存在**文件结构错误（含非法引号）**或错误行（含文件内重复 / 现有口令冲突）返回 400 且**整批拒绝、不写入任何演员或口令**；校验通过则经统一快照提交在隔离副本上一次性写入全部新演员与口令，完整 JSON 文件原子替换成功后才发布新内存版本并返回 `{ createdActors, createdCues, version }`（201），合法文件实际新增数与预览数一致；文件写入 / 替换失败返回 500，内存不发布、磁盘正式文件保持提交前完整内容 |
 | POST | `/api/replay/analyze` | 现场走位复盘分析（**只读、不写库**）：请求体 `{ csv }`（表头 `演员姓名,角色,实际时刻,实际区域`）；返回 `rows`（逐行解析结果与 `issues`、`valid`、CSV 物理 `line` 行号）、`actors`（逐演员的 `pairs` 配对明细含时间 / 区域偏差与配对成本、`missed` 漏执行口令、`extra` 多余实际记录、`cost` 各项成本）、`summary`（总行数 / 有效行 / 错误行 / 配对 / 漏项 / 多项 / 区域不符 / 时差合计 / 总成本）与 `costRule`（300 / 180 口径）；CSV 结构错误（空、缺列、**非法引号——未加引号字段中出现引号、闭合引号后夹带字符、引号未闭合**、仅表头）返回 400 |
 | POST | `/api/replay/report` | 下载本次复盘 Markdown（**只读、不写库**）：请求体 `{ csv }`，服务端按原始 CSV 重新计算后返回 `text/markdown; charset=utf-8` 附件（含汇总、CSV 逐行解析问题、每位演员配对 / 漏项 / 多项明细）；CSV 非法（含上述非法引号结构错误）时同样返回 400 |
 | GET | `/api/sightlines` | 观众视线遮挡检查：对每位观众点 × 每个舞台目标精确裁剪视线段与各矩形投影的相交参数区间（边界接触算相交、视线高度等于遮挡物高度算被挡）。返回 `pairs`（逐对结果：`status` 为 `clear`/`blocked`、`firstObstacle`（最小进入参数的首挡物）、`intersections`（各遮挡物的进入 / 退出参数，含精确分数 `num/den` 与 6 位小数 `t`、是否遮挡）、`clearable`、`requiredTargetHeight`（严格越过全部相交遮挡物的最小整数目标高度，无法解决时为 `null`）与 `raiseBy`（建议抬高量））与 `summary`（观众点 / 目标 / 遮挡物 / 视线对 / 通视 / 被挡 / 无法抬高解决计数） |
 | GET | `/api/rigging` | 吊挂布景载荷核算：逐吊挂件按力矩平衡分担（分数精确值），逐吊点按半开时段 `[起, 止)` 汇总载荷（同秒结束先于开始）。返回 `points`（按横坐标升序：`peak` 峰值载荷、`peakInterval` 峰值首次出现时段、`overloaded` 与 `intervals` 合并后的超额区间——含起止秒数、持续秒数、区间峰值 `peakLoad` 与超额量 `excess`，载荷均以 `{ num, den, kg }` 给出精确分子分母与 2 位小数值，`kg` 由分数经 BigInt 精确舍入、多件分担叠加成分数巨大时仍为有限数值）、`items`（逐件左右吊点分担明细）与 `summary`（吊点 / 吊挂件 / 超额吊点 / 超额区间计数） |
-| POST / PUT / DELETE | `/api/areas`、`/api/edges`、`/api/actors`、`/api/cues`、`/api/audiencePoints`、`/api/targets`、`/api/obstacles`、`/api/rigPoints`、`/api/rigItems`（`/:id`） | 九类资源的增改删；删除被吊挂件引用的吊点返回 409，修改吊点横坐标破坏吊挂件重心约束返回 400。连接（`edges`）按**拟更新后的完整连接**判重：无向连接正、反方向视为同一对端点，创建时同对已存在返回 409；更新时与除自身外的现存连接同对返回 **409 且不写入**——冲突时被编辑连接（端点 / 耗时 / 容量 / 封闭时段）及其它数据的内存状态与数据文件均保持原样；合法更新一次落盘，走位校验按新连接重算 |
+| POST / PUT / DELETE | `/api/areas`、`/api/edges`、`/api/actors`、`/api/cues`、`/api/audiencePoints`、`/api/targets`、`/api/obstacles`、`/api/rigPoints`、`/api/rigItems`（`/:id`） | 九类资源的增改删；删除被吊挂件引用的吊点返回 409，修改吊点横坐标破坏吊挂件重心约束返回 400。连接（`edges`）按**拟更新后的完整连接**判重：无向连接正、反方向视为同一对端点，创建时同对已存在返回 409；更新时与除自身外的现存连接同对返回 **409 且不写入**——冲突时被编辑连接（端点 / 耗时 / 容量 / 封闭时段）及其它数据的内存状态与数据文件均保持原样。所有写操作（含删除区域 / 演员的级联清理）统一走**完整快照提交**：隔离副本上完成修改 → 完整 JSON 临时文件 + `rename` 原子替换 → 成功后才发布新内存版本；写入 / 替换失败返回 500，查询仍读到提交前版本，正式文件保持完整且重启可读 |
 
 `edges` 的创建 / 更新请求体示例：
 
@@ -485,14 +549,14 @@ npm start
 ```
 ├── server.js            # Express 入口
 ├── src/
-│   ├── store.js         # JSON 文件持久化 + 示例数据初始化（含基线存储）
+│   ├── store.js         # JSON 文件持久化：完整快照提交（隔离副本修改 → 临时文件+fsync+rename 原子替换 → 成功后发布内存版本）、启动清理残留临时文件、示例数据初始化（含基线存储）
 │   ├── graph.js         # 时间依赖推演：封闭时段等待 / 绕行 + 最早到达（Dijkstra）
 │   ├── conflicts.js     # 通道占用冲突：按无向连接汇总 [进入,离开) 占用、容量校验、连续超载合并
 │   ├── validate.js      # 走位校验核心逻辑（simulateActor 逐段推演为校验与疏散快照共用事实来源）
 │   ├── evacuation.js    # 应急疏散快照：还原事件时刻位置（等待 / 停留 / 通道）、剩余路程接驳、最早疏散路线
 │   ├── dependencies.js  # 跨演员口令依赖：依赖图环检测（返回闭环口令链）、口令标签与成环错误文案
 │   ├── costume.js       # 演员换装核查：按当前模式取区段实际出发时刻，「起点 → 换装区 → 终点」两段最早路线（封闭等待 / 绕行计入）与准时 / 迟到 / 不可达判定
-│   ├── import.js        # 排练数据 CSV 导入：CSV 解析、逐行预览（格式 / 未知重名区域 / 重复 / 冲突）、数据版本、原子提交
+│   ├── import.js        # 排练数据 CSV 导入：CSV 解析、逐行预览（格式 / 未知重名区域 / 重复 / 冲突）、数据版本、提交准备（隔离快照上落实，由 store 统一原子提交）
 │   ├── replay.js        # 现场走位复盘：CSV 逐行解析（仅现有演员 / 区域，未知歧义报错）、保序一对一最优对齐 DP 与成本 / 决胜规则
 │   ├── sightline.js     # 观众视线遮挡检查：slab 法分数精确裁剪线段-矩形相交参数区间（BigInt 比较）、首挡物与最小整数目标高度
 │   ├── rigging.js       # 吊挂布景载荷核算：力矩平衡分担（分数 BigInt 精确运算）、半开时段扫描（同秒结束先于开始）、峰值载荷与相邻连续超额区间合并
@@ -501,7 +565,7 @@ npm start
 │   └── routes.js        # REST API 路由与入参校验（含依赖增删与成环拒绝、换装任务登记 / 删除与级联清理、基线保存 / 覆盖 / 清除、疏散快照、只读复盘分析 / 报告、视线遮挡检查与吊挂载荷核算）
 ├── public/              # 前端（原生 HTML/CSS/JS，含换装核查结果区、视线遮挡 SVG 平面图与吊挂载荷核算结果区）
 ├── seed/sample-data.json# 内置示例数据（含封闭时段演示、换装核查演示、视线遮挡演示与吊挂载荷演示）
-├── test/                # 回归测试（node --test；连接更新 409 提交边界、吊挂载荷大分数叠加显示等，使用独立临时数据目录）
+├── test/                # 回归测试（node --test；连接更新 409 提交边界、完整快照原子提交与写入 / 替换失败回滚、吊挂载荷大分数叠加显示等，使用独立临时数据目录）
 ├── Dockerfile
 └── docker-compose.yml
 ```
