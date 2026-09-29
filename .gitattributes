@@ -1,0 +1,2 @@
+# src/import.js 的历史版本以裸 NUL / 单元分隔符作键分隔，强制按文本展示差异
+src/import.js text diff

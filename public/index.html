@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>舞台走位校验系统</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🎭</span>
+      <div>
+        <h1>舞台走位校验系统</h1>
+        <p class="subtitle">区域连接图 · 通道容量与封闭时段 · 到位口令时间校验 · 通道占用冲突 · 演员换装核查 · 观众视线遮挡检查 · 吊挂布景载荷核算</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="btn-refresh" class="btn">🔄 重新校验</button>
+      <a id="btn-export" class="btn btn-accent" href="/api/report" download>📄 导出校验报告</a>
+      <button id="btn-reset" class="btn btn-ghost">↩️ 恢复示例数据</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 校验结果 -->
+    <section class="card" id="validation-card">
+      <div class="card-head">
+        <h2>校验结果</h2>
+        <div class="mode-switch" id="mode-switch" role="tablist">
+          <button type="button" class="mode-btn" data-mode="propagate">⛓ 连续口令延误传导</button>
+          <button type="button" class="mode-btn" data-mode="classic">📐 区段独立校验</button>
+        </div>
+      </div>
+      <p class="mode-hint" id="mode-hint"></p>
+      <div id="baseline-panel" class="baseline-panel"></div>
+      <div id="summary" class="summary"></div>
+      <div id="conflict-overview" class="conflict-overview"></div>
+      <div id="validation-results"></div>
+    </section>
+
+    <!-- 应急疏散快照 -->
+    <section class="card" id="evacuation-card">
+      <div class="card-head">
+        <h2>🚨 应急疏散快照</h2>
+      </div>
+      <p class="mode-hint">
+        输入事件时刻并勾选一个或多个出口区域：按当前校验模式的实际路线还原每位演员当时的位置（区域等待 / 停留 / 通道行进中）。
+        位于通道者先按原方向走完剩余路程，再从到达区域按事件时刻之后的封闭时段计算到任一出口的最早疏散路线；位于区域者从事件时刻直接计算；
+        因不可达链无法确定位置的演员单独标为位置未知，不做猜测。结果按最晚撤离优先排序，导出的 Markdown 报告会追加同一快照。
+      </p>
+      <form id="form-evacuation" class="entity-form evac-form">
+        <input type="text" id="evac-time" placeholder="事件时刻，如 25 或 00:25" required />
+        <div class="evac-exits" id="evac-exits"></div>
+        <div class="form-buttons">
+          <button type="submit" class="btn btn-accent" id="evac-submit">生成疏散快照</button>
+          <button type="button" class="btn btn-ghost hidden" id="evac-clear">清除快照</button>
+        </div>
+      </form>
+      <div id="evacuation-results"></div>
+    </section>
+
+    <!-- 跨演员口令依赖 -->
+    <section class="card" id="panel-dependencies">
+      <h2>🔗 跨演员口令依赖</h2>
+      <p class="mode-hint">
+        在两条口令之间维护「前置口令完成（当前模式下实际到达 + 停留时长）后至少等待 N 秒，后置口令才可实际出发」的有向约束（两条口令可属于不同演员）。
+        保存前会检查整张依赖图，<strong>成环时拒绝写入并提示闭环口令链</strong>。下方结果按当前校验模式即时重算：
+        ✅ 满足、❌ 违约（附相差秒数）、❓ 无法判定（任一端口令不可达或无实际出发时刻）。删除口令会自动清理相关依赖。
+      </p>
+      <form id="form-dependency" class="entity-form dep-form">
+        <select id="dep-before" required></select>
+        <span class="dep-arrow">—等待 ≥</span>
+        <input type="number" id="dep-wait" min="0" max="3600" step="1" placeholder="秒" class="dep-wait-input" required />
+        <span class="dep-arrow">秒→</span>
+        <select id="dep-after" required></select>
+        <div class="form-buttons">
+          <button type="submit" class="btn btn-accent" id="dep-submit">添加依赖</button>
+        </div>
+      </form>
+      <div id="dependency-results"></div>
+    </section>
+
+    <!-- 演员换装核查 -->
+    <section class="card" id="panel-costume">
+      <h2>👔 演员换装核查</h2>
+      <p class="mode-hint">
+        为同一演员<strong>相邻两条到位口令</strong>（一个区段）登记换装任务：换装区域 + 所需整数秒数，<strong>每个区段最多一项</strong>。
+        核查按<strong>当前校验模式</strong>取得该区段的实际出发时刻，依次计算「起点 → 换装区」与「换装完成 → 终点」两段最早路线——
+        两段均计入通道封闭造成的<strong>等待或绕行</strong>（第二段自换装完成时刻起算），不是静态最短耗时的简单相加。
+        结果给出换装完成时刻、最终到达时刻、相对下一口令的余量与 ✅ 准时 / ❌ 迟到 / ⛔ 不可达状态；
+        换装核查<strong>仅评估该区段，不改写原走位校验结果</strong>。删除关联口令或区域时任务自动清理，切换模式或修改区域连接后即时重算。
+      </p>
+      <form id="form-costume" class="entity-form costume-form">
+        <select id="cc-segment" required></select>
+        <select id="cc-area" required></select>
+        <input type="number" id="cc-seconds" min="0" max="3600" step="1" placeholder="换装所需秒数 0~3600" class="cc-seconds-input" required />
+        <div class="form-buttons">
+          <button type="submit" class="btn btn-accent" id="cc-submit">登记换装任务</button>
+        </div>
+      </form>
+      <div id="costume-results"></div>
+    </section>
+
+    <!-- 排练数据 CSV 导入 -->
+    <section class="card" id="panel-import">
+      <h2>📥 排练数据 CSV 导入</h2>
+      <p class="mode-hint">
+        下载模板填写排练口令后上传：系统按<strong>「姓名 + 角色」</strong>复用演员（无匹配则自动新建，同名同角色不唯一会报错）、
+        按<strong>区域名</strong>精确解析目标区域，逐行校验<strong>时间 / 停留格式</strong>、<strong>未知 / 重名区域</strong>、<strong>文件内重复</strong>与<strong>现有口令冲突</strong>。
+        <strong>存在错误行时禁止提交</strong>；预览会生成带数据版本的导入计划，提交时若底库已被修改将要求重新预览。
+        时间支持秒数（如 <code>90</code>）或 <code>mm:ss</code>（如 <code>01:30</code>），停留秒数为 0～600 的整数（留空按 0）。
+      </p>
+      <div class="import-toolbar">
+        <a class="btn" href="/api/import/template" download>⬇️ 下载 CSV 模板</a>
+        <label class="btn btn-accent import-file-btn">
+          📂 选择 CSV 文件上传预览
+          <input type="file" id="import-file" accept=".csv,text/csv" hidden />
+        </label>
+        <button type="button" class="btn btn-ghost hidden" id="import-clear">清空预览</button>
+        <span class="import-filename" id="import-filename"></span>
+      </div>
+      <div id="import-message"></div>
+      <div id="import-preview"></div>
+      <div class="form-buttons hidden" id="import-actions">
+        <button type="button" class="btn btn-accent" id="import-submit" disabled>确认提交导入</button>
+      </div>
+    </section>
+
+    <!-- 现场走位复盘 -->
+    <section class="card" id="panel-replay">
+      <h2>🎬 现场走位复盘</h2>
+      <p class="mode-hint">
+        上传现场记录 UTF-8 CSV（表头固定为 <code>演员姓名,角色,实际时刻,实际区域</code>）：系统<strong>仅解析现有演员（姓名 + 角色）与现有区域（名称）</strong>，
+        未知或歧义的演员 / 区域、时刻格式错误<strong>逐行报错且不参与对齐</strong>。服务端按演员将实际记录与计划口令做
+        <strong>保持先后顺序的一对一最优对齐</strong>（两侧分别按计划时刻/口令 ID、实际时刻/CSV 行号排序）：
+        配对成本为<strong>时差绝对值</strong>，区域不符加 <strong>300</strong>，每条漏执行口令或多余记录加 <strong>180</strong>；
+        成本相同时先取配对数多者，再取实际记录行号序列字典序较小者，同一记录不重复匹配。
+        复盘为只读分析，<strong>不会改写任何走位数据</strong>；时刻支持秒数（如 <code>90</code>）或 <code>mm:ss</code>（如 <code>01:30</code>）。
+      </p>
+      <div class="import-toolbar">
+        <label class="btn btn-accent import-file-btn">
+          📂 选择现场记录 CSV 上传分析
+          <input type="file" id="replay-file" accept=".csv,text/csv" hidden />
+        </label>
+        <button type="button" class="btn btn-ghost hidden" id="replay-clear">清空复盘</button>
+        <button type="button" class="btn hidden" id="replay-download" disabled>⬇️ 下载本次复盘 Markdown</button>
+        <span class="import-filename" id="replay-filename"></span>
+      </div>
+      <div id="replay-message"></div>
+      <div id="replay-results"></div>
+    </section>
+
+    <!-- 观众视线遮挡检查 -->
+    <section class="card" id="panel-sightline">
+      <h2>👁 观众视线遮挡检查</h2>
+      <p class="mode-hint">
+        以整数厘米维护<strong>观众点</strong>（x、y、眼高）、<strong>舞台目标</strong>（x、y、目标高）与<strong>轴对齐矩形遮挡物</strong>（x、y、宽、深、高）。
+        服务端对每条「观众 → 目标」视线段<strong>精确裁剪</strong>其与各矩形投影的相交参数区间（slab 法分数运算，<strong>边界接触算相交</strong>，不是只测矩形中心或采样点）；
+        相交区间内视线高度 ≤ 遮挡物高度（<strong>等于也算被挡</strong>）即判定遮挡，按<strong>最小进入参数</strong>确定首挡物，
+        并给出使视线<strong>严格越过全部相交遮挡物</strong>的最小整数目标高度与建议抬高量。
+      </p>
+      <div id="sight-summary" class="summary"></div>
+      <div id="sight-map"></div>
+      <p class="sight-legend">
+        <span class="sight-key"><span class="sight-dot audience"></span>观众点（眼高）</span>
+        <span class="sight-key"><span class="sight-dot target"></span>舞台目标（目标高）</span>
+        <span class="sight-key"><span class="sight-swatch obstacle"></span>遮挡物（红框 = 某视线的首挡物）</span>
+        <span class="sight-key"><span class="sight-swatch line-clear"></span>通视</span>
+        <span class="sight-key"><span class="sight-swatch line-blocked"></span>被挡</span>
+        <span class="sight-key"><span class="sight-swatch line-infeasible"></span>被挡·无法抬高解决</span>
+        <span class="sight-key">点击视线或表格行可互相定位</span>
+      </p>
+      <div id="sight-results"></div>
+    </section>
+
+    <!-- 吊挂布景载荷核算 -->
+    <section class="card" id="panel-rigging">
+      <h2>🏗 吊挂布景载荷核算</h2>
+      <p class="mode-hint">
+        维护同一横梁上的<strong>吊点</strong>（横坐标、额定载荷）与<strong>吊挂件</strong>（重量、重心横坐标、左右吊点、生效时段 <code>[起, 止)</code>）。
+        每件按<strong>力矩平衡</strong>分担到两吊点：左点分担 = 重量 ×（右点横坐标 − 重心横坐标）÷ 吊点间距，右点分担 = 重量 ×（重心横坐标 − 左点横坐标）÷ 吊点间距；
+        累计与比较全程使用<strong>有理数（分数）精确运算</strong>——累计载荷恰好等于额定载荷不算超额，临界值不会因舍入被误判。
+        同一秒<strong>结束先于开始</strong>（半开时段不叠加），逐吊点输出峰值载荷与超额区间（载荷 &gt; 额定载荷），首尾相接的连续超额自动合并；
+        删除被吊挂件引用的吊点会被拒绝。
+      </p>
+      <div id="rig-summary" class="summary"></div>
+      <div id="rig-results"></div>
+      <div id="rig-item-shares"></div>
+    </section>
+
+    <!-- 数据管理 -->
+    <div class="panels">
+      <section class="card" id="panel-rigpoints">
+        <h2>吊点（同一横梁）</h2>
+        <form id="form-rigpoint" class="entity-form">
+          <input type="hidden" id="rigp-id" />
+          <input type="text" id="rigp-name" placeholder="吊点名称，如：1 号吊点" required maxlength="30" />
+          <input type="number" id="rigp-x" placeholder="横坐标 (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="rigp-rated" placeholder="额定载荷 (kg)" min="1" max="1000000" step="1" required />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="rigp-submit">添加吊点</button>
+            <button type="button" class="btn btn-ghost hidden" id="rigp-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>名称</th><th>横坐标</th><th>额定载荷</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="rigpoints-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="card" id="panel-rigitems">
+        <h2>吊挂件</h2>
+        <form id="form-rigitem" class="entity-form">
+          <input type="hidden" id="rigi-id" />
+          <input type="text" id="rigi-name" placeholder="吊挂件名称，如：天幕景片" required maxlength="30" />
+          <input type="number" id="rigi-weight" placeholder="重量 (kg)" min="1" max="1000000" step="1" required />
+          <input type="number" id="rigi-cog" placeholder="重心横坐标 (cm)" min="-1000000" max="1000000" step="1" required />
+          <select id="rigi-left" required></select>
+          <select id="rigi-right" required></select>
+          <input type="text" id="rigi-start" placeholder="生效开始，如 30 或 00:30" required />
+          <input type="text" id="rigi-end" placeholder="生效结束，如 90 或 01:30" required />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="rigi-submit">添加吊挂件</button>
+            <button type="button" class="btn btn-ghost hidden" id="rigi-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>名称</th><th>重量</th><th>重心</th><th>左吊点</th><th>右吊点</th><th>生效时段</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="rigitems-tbody"></tbody>
+        </table>
+      </section>
+    </div>
+
+    <!-- 数据管理 -->
+    <div class="panels">
+      <section class="card" id="panel-audience">
+        <h2>观众点（视线遮挡检查）</h2>
+        <form id="form-audience" class="entity-form">
+          <input type="hidden" id="aud-id" />
+          <input type="text" id="aud-name" placeholder="观众点名称，如：A 区 1 排 1 座" required maxlength="30" />
+          <input type="number" id="aud-x" placeholder="x (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="aud-y" placeholder="y (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="aud-eye" placeholder="眼高 (cm)" min="0" max="100000" step="1" required />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="aud-submit">添加观众点</button>
+            <button type="button" class="btn btn-ghost hidden" id="aud-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>名称</th><th>x</th><th>y</th><th>眼高</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="audience-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="card" id="panel-targets">
+        <h2>舞台目标（视线遮挡检查）</h2>
+        <form id="form-target" class="entity-form">
+          <input type="hidden" id="tgt-id" />
+          <input type="text" id="tgt-name" placeholder="目标名称，如：舞台中央表演点" required maxlength="30" />
+          <input type="number" id="tgt-x" placeholder="x (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="tgt-y" placeholder="y (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="tgt-height" placeholder="目标高 (cm)" min="0" max="100000" step="1" required />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="tgt-submit">添加舞台目标</button>
+            <button type="button" class="btn btn-ghost hidden" id="tgt-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>名称</th><th>x</th><th>y</th><th>目标高</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="targets-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="card" id="panel-obstacles">
+        <h2>遮挡物（轴对齐矩形）</h2>
+        <form id="form-obstacle" class="entity-form">
+          <input type="hidden" id="obs-id" />
+          <input type="text" id="obs-name" placeholder="遮挡物名称，如：乐池护栏" required maxlength="30" />
+          <input type="number" id="obs-x" placeholder="x (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="obs-y" placeholder="y (cm)" min="-1000000" max="1000000" step="1" required />
+          <input type="number" id="obs-width" placeholder="宽 (cm)" min="1" max="1000000" step="1" required />
+          <input type="number" id="obs-depth" placeholder="深 (cm)" min="1" max="1000000" step="1" required />
+          <input type="number" id="obs-height" placeholder="高 (cm)" min="0" max="100000" step="1" required />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="obs-submit">添加遮挡物</button>
+            <button type="button" class="btn btn-ghost hidden" id="obs-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>名称</th><th>x</th><th>y</th><th>宽</th><th>深</th><th>高</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="obstacles-tbody"></tbody>
+        </table>
+      </section>
+    </div>
+
+    <!-- 数据管理 -->
+    <div class="panels">
+      <section class="card" id="panel-areas">
+        <h2>舞台区域</h2>
+        <form id="form-area" class="entity-form">
+          <input type="hidden" id="area-id" />
+          <input type="text" id="area-name" placeholder="区域名称，如：舞台中央" required maxlength="30" />
+          <input type="text" id="area-desc" placeholder="备注（可选）" maxlength="60" />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="area-submit">添加区域</button>
+            <button type="button" class="btn btn-ghost hidden" id="area-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>名称</th><th>备注</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="areas-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="card" id="panel-edges">
+        <h2>区域连接（通行耗时 · 容量 · 封闭时段）</h2>
+        <form id="form-edge" class="entity-form">
+          <input type="hidden" id="edge-id" />
+          <select id="edge-a" required></select>
+          <select id="edge-b" required></select>
+          <input type="number" id="edge-seconds" placeholder="耗时(秒)" min="0" step="1" required />
+          <input type="number" id="edge-capacity" placeholder="容量(1~10)" min="1" max="10" step="1" title="同一时刻允许并发占用该通道的人数（1～10），缺省 1" />
+          <div class="closures-editor" id="closures-editor">
+            <div class="closures-head">
+              <span>🚧 通道封闭时段（秒，可添加多段）</span>
+              <button type="button" class="btn btn-small" id="btn-add-closure">＋ 添加时段</button>
+            </div>
+            <div id="closures-list"></div>
+            <p class="closures-hint">封闭规则：开始 ≤ t &lt; 结束 内通道不可通行；校验时将在前一区域等待或自动绕行。容量为同一时刻允许并发占用的人数（1～10，缺省 1），超过即产生通道占用冲突。</p>
+          </div>
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="edge-submit">添加连接</button>
+            <button type="button" class="btn btn-ghost hidden" id="edge-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>区域 A</th><th>区域 B</th><th>通行耗时</th><th>容量</th><th>封闭时段</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="edges-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="card" id="panel-actors">
+        <h2>演员</h2>
+        <form id="form-actor" class="entity-form">
+          <input type="hidden" id="actor-id" />
+          <input type="text" id="actor-name" placeholder="演员姓名，如：张三" required maxlength="30" />
+          <input type="text" id="actor-role" placeholder="角色（可选），如：饰 王子" maxlength="30" />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="actor-submit">添加演员</button>
+            <button type="button" class="btn btn-ghost hidden" id="actor-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>姓名</th><th>角色</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="actors-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="card" id="panel-cues">
+        <h2>到位口令</h2>
+        <form id="form-cue" class="entity-form">
+          <input type="hidden" id="cue-id" />
+          <select id="cue-actor" required></select>
+          <select id="cue-area" required></select>
+          <input type="text" id="cue-time" placeholder="时间，如 90 或 01:30" required />
+          <input type="number" id="cue-dwell" placeholder="停留(秒) 0~600" min="0" max="600" step="1" title="在该区域需停留的秒数（0～600），用于连续口令延误传导模式" />
+          <input type="text" id="cue-note" placeholder="口令说明（可选）" maxlength="60" />
+          <div class="form-buttons">
+            <button type="submit" class="btn btn-accent" id="cue-submit">添加口令</button>
+            <button type="button" class="btn btn-ghost hidden" id="cue-cancel">取消编辑</button>
+          </div>
+        </form>
+        <table>
+          <thead><tr><th>演员</th><th>时间</th><th>目标区域</th><th>停留</th><th>说明</th><th class="col-ops">操作</th></tr></thead>
+          <tbody id="cues-tbody"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
