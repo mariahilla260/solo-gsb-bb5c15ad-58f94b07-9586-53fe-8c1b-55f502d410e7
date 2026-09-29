@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const store = require('./store');
 
 /**
  * 排练数据 CSV 导入：
@@ -8,8 +7,9 @@ const store = require('./store');
  * - 逐行校验时间 / 停留格式，并按解析后的「演员身份 + 目标区域 + 整数秒」
  *   判文件内重复（「90」与「01:30」视为同一时刻）与现有口令冲突；
  * - 预览生成带数据版本（底库 areas/actors/cues 的哈希）的导入计划；
- * - 提交时版本不一致返回 stale（路由层映射为 409），且复用同一判重口径；
- *   存在重复 / 冲突时整批拒绝，否则一次性写入，失败回滚不落库。
+ * - 提交时先用 checkImport 做只读版本 / 错误行判定（stale → 409、invalid → 400），
+ *   通过后由路由在 store.commit 的隔离草稿上执行 applyImport：存在重复 / 冲突时整批拒绝，
+ *   完整 JSON 快照原子落盘成功后才发布新内存版本；落盘失败草稿丢弃，正式数据不受影响。
  */
 
 const COL_NAME = '姓名';
@@ -453,14 +453,12 @@ function buildImportPlan(data, csv) {
 }
 
 /**
- * 按预览计划原子提交：
+ * 提交前只读判定（不修改任何数据）：
  * 1. 底库版本与预览时不一致 → { status: 'stale' }（HTTP 409），要求重新预览；
  * 2. 重新解析 CSV（不信任客户端回传的计划正文），仍有错误行 → { status: 'invalid' }（HTTP 400）；
- * 3. 写入前按预览的同一口径（演员身份 + 区域 + 解析后整数秒）再复核口令键，
- *    发现文件内重复或与现有口令冲突即抛 ImportFileError 整批拒绝、不写任何数据；
- * 4. 一次性在内存中追加全部新演员与口令并单次落盘；任何异常回滚内存、不部分落库。
+ * 3. 全部通过 → { status: 'ready', plan }，由路由在 store.commit 的隔离草稿上执行 applyImport。
  */
-function commitImport(data, csv, expectedVersion) {
+function checkImport(data, csv, expectedVersion) {
   const current = dataVersion(data);
   if (current !== expectedVersion) {
     return { status: 'stale', currentVersion: current };
@@ -470,65 +468,67 @@ function commitImport(data, csv, expectedVersion) {
   if (plan.summary.errorRows > 0) {
     return { status: 'invalid', plan };
   }
+  return { status: 'ready', plan };
+}
 
-  const actorCount0 = data.actors.length;
-  const cueCount0 = data.cues.length;
-  try {
-    const actorIdByKey = new Map();
-    for (const a of data.actors) actorIdByKey.set(actorKey(a.name, a.role), a.id);
+/**
+ * 在 store.commit 提供的隔离草稿上一次性追加全部新演员与口令（不做任何落盘）。
+ * 写入前按预览的同一口径（演员身份 + 区域 + 解析后整数秒）再复核口令键，
+ * 发现文件内重复或与现有口令冲突即抛 ImportFileError 整批拒绝——此时草稿随抛错丢弃，
+ * 既不落盘也不发布内存版本，无需回滚（隔离草稿之外的数据从未被改动）。
+ * 返回新增数量与写入后的新数据版本；完整 JSON 随后由 store.commit 单次原子落盘。
+ */
+function applyImport(draft, plan) {
+  const actorCount0 = draft.actors.length;
+  const cueCount0 = draft.cues.length;
+  const actorIdByKey = new Map();
+  for (const a of draft.actors) actorIdByKey.set(actorKey(a.name, a.role), a.id);
 
-    for (const na of plan.newActors) {
-      const key = actorKey(na.name, na.role);
-      if (actorIdByKey.has(key)) continue; // 防御：底库刚刚出现过同键演员
-      const id = crypto.randomUUID();
-      data.actors.push({ id, name: na.name, role: na.role });
-      actorIdByKey.set(key, id);
-    }
-
-    // 与预览同一判重口径：口令键 = 演员身份 + 目标区域 + 解析后整数秒。
-    // 预览已按此口径拦下文件内重复与现有口令冲突；此处复核若仍命中重复键，
-    // 整批抛错拒绝（由 catch 回滚内存），绝不静默跳过——保证预览数量与实际新增数一致。
-    const seenKeys = existingCueKeySet(data);
-    for (const row of plan.rows.filter((r) => r.valid)) {
-      const actorId = row.actorId || actorIdByKey.get(actorKey(row.name, row.role));
-      if (!actorId || !row.areaId || row.time === null) {
-        throw new ImportFileError('导入计划与当前底库不一致（演员 / 区域 / 时间无法解析），请重新预览后再提交');
-      }
-      const key = cueDedupKey(`id:${actorId}`, row.areaId, row.time);
-      if (seenKeys.has(key)) {
-        throw new ImportFileError(
-          `口令文件内重复或与现有口令冲突：${row.name} ${fmtClock(row.time)} 到达「${row.areaName}」，请修正后重新预览`
-        );
-      }
-      seenKeys.add(key);
-      data.cues.push({
-        id: crypto.randomUUID(),
-        actorId,
-        areaId: row.areaId,
-        time: row.time,
-        dwell: row.dwell ?? 0,
-        note: row.note || '',
-      });
-    }
-
-    store.save(); // 单次落盘：成功全部生效，抛异常则回滚内存
-    return {
-      status: 'ok',
-      createdActors: data.actors.length - actorCount0,
-      createdCues: data.cues.length - cueCount0,
-      version: dataVersion(data),
-    };
-  } catch (err) {
-    // 任何失败：截断回追加前的长度，保证不会部分落库（新演员也一并回滚，不留空演员）
-    data.actors.splice(actorCount0);
-    data.cues.splice(cueCount0);
-    throw err;
+  for (const na of plan.newActors) {
+    const key = actorKey(na.name, na.role);
+    if (actorIdByKey.has(key)) continue; // 防御：底库刚刚出现过同键演员
+    const id = crypto.randomUUID();
+    draft.actors.push({ id, name: na.name, role: na.role });
+    actorIdByKey.set(key, id);
   }
+
+  // 与预览同一判重口径：口令键 = 演员身份 + 区域 + 解析后整数秒。
+  // 预览已按此口径拦下文件内重复与现有口令冲突；此处复核若仍命中重复键，
+  // 整批抛错拒绝（草稿随异常丢弃），绝不静默跳过——保证预览数量与实际新增数一致。
+  const seenKeys = existingCueKeySet(draft);
+  for (const row of plan.rows.filter((r) => r.valid)) {
+    const actorId = row.actorId || actorIdByKey.get(actorKey(row.name, row.role));
+    if (!actorId || !row.areaId || row.time === null) {
+      throw new ImportFileError('导入计划与当前底库不一致（演员 / 区域 / 时间无法解析），请重新预览后再提交');
+    }
+    const key = cueDedupKey(`id:${actorId}`, row.areaId, row.time);
+    if (seenKeys.has(key)) {
+      throw new ImportFileError(
+        `口令文件内重复或与现有口令冲突：${row.name} ${fmtClock(row.time)} 到达「${row.areaName}」，请修正后重新预览`
+      );
+    }
+    seenKeys.add(key);
+    draft.cues.push({
+      id: crypto.randomUUID(),
+      actorId,
+      areaId: row.areaId,
+      time: row.time,
+      dwell: row.dwell ?? 0,
+      note: row.note || '',
+    });
+  }
+
+  return {
+    createdActors: draft.actors.length - actorCount0,
+    createdCues: draft.cues.length - cueCount0,
+    version: dataVersion(draft),
+  };
 }
 
 module.exports = {
   buildImportPlan,
-  commitImport,
+  checkImport,
+  applyImport,
   dataVersion,
   parseCsv,
   parseClockSeconds,

@@ -8,7 +8,8 @@ const { toMarkdown, toReplayMarkdown } = require('./report');
 const { findCycle, cycleMessage, MAX_WAIT_SECONDS } = require('./dependencies');
 const {
   buildImportPlan,
-  commitImport,
+  checkImport,
+  applyImport,
   ImportFileError,
   TEMPLATE_HEADER,
 } = require('./import');
@@ -313,8 +314,8 @@ router.get('/evacuation', (req, res) => {
 });
 
 router.post('/reset', (req, res) => {
-  store.reset();
-  res.json(store.load());
+  // 完整快照提交：种子快照原子落盘成功后才发布内存版本；失败由统一错误处理返回 500，查询仍读旧版本
+  res.json(store.reset());
 });
 
 /* ---------- 走位方案基线 ---------- */
@@ -323,10 +324,11 @@ router.post('/reset', (req, res) => {
 router.post('/baseline/:mode', (req, res) => {
   const { mode } = req.params;
   if (!MODES.includes(mode)) return res.status(400).json({ error: 'mode 必须是 classic 或 propagate' });
-  const data = store.load();
-  const result = validate(data, mode);
-  data.baselines[mode] = { savedAt: new Date().toISOString(), result };
-  store.save();
+  const result = validate(store.load(), mode); // 校验结果在当前已发布版本上计算（只读）
+  // 在隔离草稿上挂载基线；完整快照落盘成功后才发布并返回
+  const { data } = store.commit((draft) => {
+    draft.baselines[mode] = { savedAt: new Date().toISOString(), result };
+  });
   res.status(201).json({ baseline: baselineMeta(data, mode), comparison: buildComparison(result, data.baselines[mode].result) });
 });
 
@@ -336,10 +338,11 @@ router.delete('/baseline/:mode', (req, res) => {
   if (mode !== 'all' && !MODES.includes(mode)) {
     return res.status(400).json({ error: 'mode 必须是 classic 或 propagate（或 all）' });
   }
-  const data = store.load();
-  if (mode === 'all') data.baselines = {};
-  else delete data.baselines[mode];
-  store.save();
+  // 删除只落在隔离草稿上，快照原子替换成功后才对后续查询可见
+  store.commit((draft) => {
+    if (mode === 'all') draft.baselines = {};
+    else delete draft.baselines[mode];
+  });
   res.status(204).end();
 });
 
@@ -353,10 +356,20 @@ function pruneDependencies(data) {
   );
 }
 
-/** 新增依赖：写入前对整张依赖图做环检测，成环（含自环、重复反向边）不写入 */
+/** 草稿内新增依赖被业务规则拒绝（环检测等）：携带 HTTP 响应信息，且不触发落盘 / 发布 */
+class DependencyRejected extends Error {
+  constructor(status, body) {
+    super(body.error);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/** 新增依赖：写入前在隔离草稿上对整张依赖图做环检测，成环（含自环、重复反向边）不写入 */
 router.post('/dependencies', (req, res) => {
   const data = store.load();
   const body = req.body || {};
+  // 入参校验全部针对当前已发布版本（只读）；任何 4xx 都不触碰草稿之外的数据
   const cueIds = new Set(data.cues.map((c) => c.id));
   if (!cueIds.has(body.predecessorId) || !cueIds.has(body.successorId)) {
     return res.status(400).json({ error: '前置 / 后置口令必须是已存在的口令' });
@@ -378,25 +391,35 @@ router.post('/dependencies', (req, res) => {
     successorId: body.successorId,
     waitSeconds: body.waitSeconds,
   };
-  data.dependencies.push(candidate);
 
-  const cycle = findCycle(data.dependencies);
-  if (cycle) {
-    data.dependencies.pop(); // 成环：不写入
-    return res.status(400).json({ error: cycleMessage(data, cycle), cycle });
+  try {
+    // 追加与环检测只发生在隔离草稿上：成环抛 DependencyRejected，草稿随异常丢弃、绝不落盘
+    const { result } = store.commit((draft) => {
+      draft.dependencies.push(candidate);
+      const cycle = findCycle(draft.dependencies);
+      if (cycle) {
+        throw new DependencyRejected(400, { error: cycleMessage(draft, cycle), cycle });
+      }
+      return candidate;
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    if (err instanceof DependencyRejected) return res.status(err.status).json(err.body);
+    throw err; // 落盘 / 替换失败：交统一错误处理返回 500，现有查询仍读到提交前版本
   }
-
-  store.save();
-  res.status(201).json(candidate);
 });
 
 /** 删除依赖 */
 router.delete('/dependencies/:id', (req, res) => {
   const data = store.load();
-  const idx = data.dependencies.findIndex((d) => d.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: '依赖不存在' });
-  data.dependencies.splice(idx, 1);
-  store.save();
+  if (!data.dependencies.some((d) => d.id === req.params.id)) {
+    return res.status(404).json({ error: '依赖不存在' });
+  }
+  // 删除只落在隔离草稿上，完整快照落盘成功后才发布
+  store.commit((draft) => {
+    const idx = draft.dependencies.findIndex((d) => d.id === req.params.id);
+    draft.dependencies.splice(idx, 1);
+  });
   res.status(204).end();
 });
 
@@ -453,18 +476,25 @@ router.post('/costume-changes', (req, res) => {
     areaId: body.areaId,
     seconds: body.seconds,
   };
-  data.costumeChanges.push(task);
-  store.save();
-  res.status(201).json(task);
+  // 追加只落在隔离草稿上，完整快照原子落盘成功后才发布新内存版本
+  const { result } = store.commit((draft) => {
+    draft.costumeChanges.push(task);
+    return task;
+  });
+  res.status(201).json(result);
 });
 
 /** 删除换装任务 */
 router.delete('/costume-changes/:id', (req, res) => {
   const data = store.load();
-  const idx = data.costumeChanges.findIndex((t) => t.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: '换装任务不存在' });
-  data.costumeChanges.splice(idx, 1);
-  store.save();
+  if (!data.costumeChanges.some((t) => t.id === req.params.id)) {
+    return res.status(404).json({ error: '换装任务不存在' });
+  }
+  // 删除只落在隔离草稿上，完整快照落盘成功后才发布
+  store.commit((draft) => {
+    const idx = draft.costumeChanges.findIndex((t) => t.id === req.params.id);
+    draft.costumeChanges.splice(idx, 1);
+  });
   res.status(204).end();
 });
 
@@ -510,28 +540,34 @@ router.post('/import/commit', (req, res) => {
     return res.status(400).json({ error: '缺少数据版本，请先重新预览后再提交' });
   }
 
-  let result;
+  // 只读判定（版本 / 错误行）在当前已发布版本上完成，不修改任何数据
+  let checked;
   try {
-    result = commitImport(data, csv, expectedVersion);
+    checked = checkImport(data, csv, expectedVersion);
   } catch (err) {
     if (err instanceof ImportFileError) return res.status(400).json({ error: err.message });
     throw err;
   }
 
-  if (result.status === 'stale') {
+  if (checked.status === 'stale') {
     return res.status(409).json({
       error: '底库数据已变化（演员 / 区域 / 口令被修改），请重新预览后再提交',
-      currentVersion: result.currentVersion,
+      currentVersion: checked.currentVersion,
     });
   }
-  if (result.status === 'invalid') {
-    return res.status(400).json({ error: 'CSV 中仍存在错误行，请修正后重新预览', plan: result.plan });
+  if (checked.status === 'invalid') {
+    return res.status(400).json({ error: 'CSV 中仍存在错误行，请修正后重新预览', plan: checked.plan });
   }
-  res.status(201).json({
-    createdActors: result.createdActors,
-    createdCues: result.createdCues,
-    version: result.version,
-  });
+
+  // 追加与复核全部落在隔离草稿上；草稿内复核抛 ImportFileError 时不落盘、不发布（仍为 400）。
+  // 完整 JSON 原子落盘成功后才返回 201；落盘 / 替换失败由统一错误处理返回 500，正式数据保持提交前版本。
+  try {
+    const { result } = store.commit((draft) => applyImport(draft, checked.plan));
+    res.status(201).json(result);
+  } catch (err) {
+    if (err instanceof ImportFileError) return res.status(400).json({ error: err.message });
+    throw err;
+  }
 });
 
 /* ---------- 现场走位复盘 ---------- */
@@ -603,9 +639,12 @@ router.post('/:collection', (req, res) => {
     if (dup) return res.status(409).json({ error: '两个区域之间已存在连接，可直接编辑耗时' });
   }
 
-  data[collection].push(item);
-  store.save();
-  res.status(201).json(item);
+  // 新增只落在隔离草稿上，完整 JSON 快照原子落盘成功后才发布并返回
+  const { result } = store.commit((draft) => {
+    draft[collection].push(item);
+    return item;
+  });
+  res.status(201).json(result);
 });
 
 router.put('/:collection/:id', (req, res) => {
@@ -613,8 +652,7 @@ router.put('/:collection/:id', (req, res) => {
   if (!COLLECTIONS.includes(collection)) return res.status(404).json({ error: '未知资源类型' });
 
   const data = store.load();
-  const item = data[collection].find((x) => x.id === id);
-  if (!item) return res.status(404).json({ error: '记录不存在' });
+  if (!data[collection].some((x) => x.id === id)) return res.status(404).json({ error: '记录不存在' });
 
   const err = validators[collection](req.body || {}, data);
   if (err) return res.status(400).json({ error: err });
@@ -626,8 +664,7 @@ router.put('/:collection/:id', (req, res) => {
   }
 
   // 先得到「拟更新后的完整字段」，所有冲突检查都针对它进行；
-  // 检查通过前不得改动内存中的现存记录（否则返回 4xx 后内存会留下脏状态，
-  // 后续查询 / 校验会读到串改数据，下一次成功保存还可能把脏状态写入数据文件）。
+  // 检查通过前不构造任何修改（修改只会发生在隔离草稿上：返回 4xx 时既无内存脏状态也不写文件）。
   const updates = sanitize(collection, req.body);
 
   if (collection === 'edges') {
@@ -642,9 +679,13 @@ router.put('/:collection/:id', (req, res) => {
     }
   }
 
-  Object.assign(item, updates);
-  store.save();
-  res.json(item);
+  // 在隔离草稿上完成赋值；完整快照原子落盘成功后才发布新版本，返回草稿中的更新结果
+  const { result } = store.commit((draft) => {
+    const target = draft[collection].find((x) => x.id === id);
+    Object.assign(target, updates);
+    return target;
+  });
+  res.json(result);
 });
 
 router.delete('/:collection/:id', (req, res) => {
@@ -652,8 +693,7 @@ router.delete('/:collection/:id', (req, res) => {
   if (!COLLECTIONS.includes(collection)) return res.status(404).json({ error: '未知资源类型' });
 
   const data = store.load();
-  const idx = data[collection].findIndex((x) => x.id === id);
-  if (idx === -1) return res.status(404).json({ error: '记录不存在' });
+  if (!data[collection].some((x) => x.id === id)) return res.status(404).json({ error: '记录不存在' });
 
   // 吊点被吊挂件引用时提示并拒绝删除
   if (collection === 'rigPoints') {
@@ -666,22 +706,24 @@ router.delete('/:collection/:id', (req, res) => {
     }
   }
 
-  data[collection].splice(idx, 1);
+  // 删除与级联清理全部在隔离草稿上一次完成；完整快照落盘成功后才对后续查询可见
+  store.commit((draft) => {
+    const idx = draft[collection].findIndex((x) => x.id === id);
+    draft[collection].splice(idx, 1);
 
-  // 级联清理，保证校验数据一致
-  if (collection === 'areas') {
-    data.edges = data.edges.filter((e) => e.a !== id && e.b !== id);
-    data.cues = data.cues.filter((c) => c.areaId !== id);
-  } else if (collection === 'actors') {
-    data.cues = data.cues.filter((c) => c.actorId !== id);
-  }
+    // 级联清理，保证校验数据一致
+    if (collection === 'areas') {
+      draft.edges = draft.edges.filter((e) => e.a !== id && e.b !== id);
+      draft.cues = draft.cues.filter((c) => c.areaId !== id);
+    } else if (collection === 'actors') {
+      draft.cues = draft.cues.filter((c) => c.actorId !== id);
+    }
 
-  // 删除口令（或因删除区域 / 演员连带删除口令）后，级联清理相关口令依赖
-  pruneDependencies(data);
-  // 删除口令 / 区域（含连带删除口令）后，级联清理相关换装任务
-  pruneCostumeChanges(data);
-
-  store.save();
+    // 删除口令（或因删除区域 / 演员连带删除口令）后，级联清理相关口令依赖
+    pruneDependencies(draft);
+    // 删除口令 / 区域（含连带删除口令）后，级联清理相关换装任务
+    pruneCostumeChanges(draft);
+  });
   res.status(204).end();
 });
 
